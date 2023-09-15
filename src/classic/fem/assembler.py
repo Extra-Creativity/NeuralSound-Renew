@@ -3,7 +3,7 @@ from numba import njit
 import numpy as np
 from scipy.sparse import coo_matrix
 
-def vertices(voxel, length):
+def vertices(voxel, length = 1.0):
     return _vertices(voxel) * length
 
 def stiff_matrix(voxel, youngs, possion, length):

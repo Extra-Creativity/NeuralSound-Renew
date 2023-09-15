@@ -1,84 +1,102 @@
 import sys
 import argparse
-import MinkowskiEngine as ME
-from numpy.linalg import eig
+
+sys.path.append("..")
+from src.dataset import DeepModalDataset
+from src.net.unet import UNet3D
 import torch
-import torch.nn as nn
-from torch import optim
-sys.path.append('..')
-sys.path.append('.')
-from dataset import DeepModalDataset, deepmodal_collation_fn
-from src.net.trainer_template import *
-import src.net.eigennet as eigennet
-from src.classic.fem.femModel import Hexahedron_model, Material
-from src.classic.lobpcg import relative_error, random_init, matrix_norm, variance, vec_norm
-from src.classic.fem.project_util import spmm_conv, vox2vert, vert2vox, diag_matrix
-from src.classic.lobpcg import lobpcg
+from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
-# torch.set_grad_enabled(False)
-def net(coords, x, edge):
-    vert_num = x.shape[0]//3
-    x = x.reshape(vert_num, 3*n)
-    feats_in = vert2vox(x, edge)  # [voxel_num, 8*3*n]
-    voxel_num = feats_in.shape[0]
-    feats_in = feats_in.reshape(voxel_num, 8*3*n)
-    bcoords = ME.utils.batched_coordinates(coords).to(device)
-    sparse_tensor = ME.SparseTensor(feats_in, bcoords)
-    output = Config.net(sparse_tensor).F
-    output = vox2vert(output, edge, 'mean').reshape(vert_num*3, n)
-    return output
+parser = argparse.ArgumentParser()
+parser.add_argument("--tag", type=str, default="test")
+parser.add_argument(
+    "--dataset", type=str, default="/data2/NeuralSound/ModelNet/pointcloud/deepmodal"
+)
+parser.add_argument("--batch_size", type=int, default=16)
+parser.add_argument("--filter_num", type=int, default=16)
+parser.add_argument("--epoch", type=int, default=200)
+args = parser.parse_args()
 
+import os
 
-def forward_fun(items):
-    coords, edge_shifted, ind_lst, vecs, mask, filename = items
-    vert_num = ind_lst[-1]
-    x0 = torch.randn(vert_num*3, n).to(device)
-    x1 = net(coords, x0, edge_shifted)
-    vecs = vecs[0].to(device)
-    mask = mask[0].to(device)
-    err_vecs = torch.norm(vecs - x1[:,:n//2]) / torch.norm(vecs)
-    err_mask = torch.norm(mask - x1[:,n//2:]) / torch.norm(mask)
-    return err_vecs + err_mask
+log_dir = "log/%s" % args.tag
+if os.path.exists(log_dir):
+    os.system("rm -r %s" % log_dir)
 
-    
-def loss_fun(err):
-    # print(err.item())
-    return err
+writer = SummaryWriter(log_dir)
+train_dataset = DeepModalDataset(args.dataset, "train")
+val_dataset = DeepModalDataset(args.dataset, "val")
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--tag', type=str, default='test')
-    parser.add_argument('--dataset', type=str, default='../dataset/deepmodal')
-    parser.add_argument('--net', type=str, default='defaultUnet')
-    parser.add_argument('--nonlinear', dest='nonlinear', action='store_true')
-    parser.set_defaults(nonlinear=False) # 默认线性，指定--nonlinear为非线性
-    parser.add_argument('--diag', dest='diag', action='store_true')
-    parser.set_defaults(diag=False)
-    parser.add_argument('--cuda', type=int, default=0)
-    args = parser.parse_args()
+train_loader = torch.utils.data.DataLoader(
+    train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=8
+)
+val_loader = torch.utils.data.DataLoader(
+    val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=8
+)
 
-    Config.dataset_root_dir = args.dataset
-    Config.tag = args.tag
-    device = torch.device(f'cuda:{args.cuda}')
-    Config.device = device
-    Config.CustomDataset = DeepModalDataset
-    Config.custom_collation_fn = deepmodal_collation_fn
-    Config.forward_fun = forward_fun
-    Config.loss_fun = loss_fun
-    n = 32*2
-    if args.diag:
-        in_feat_num = 32
+model = UNet3D(1, 32, args.filter_num).cuda()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, factor=0.5, patience=4, verbose=True
+)
+loss_func = torch.nn.MSELoss()
+loss_mask_func = torch.nn.BCEWithLogitsLoss()
+
+def step(outdir, train=True):
+    if train:
+        model.train()
+        loader = train_loader
     else:
-        in_feat_num = 24*n
-    out_k = 2
-    out_feat_num = 24*n
+        model.eval()
+        loader = val_loader
+    loss_sum = 0
+    for x, y, mask, amp, mask_mask in tqdm(loader):
+        x = x.cuda()
+        y = y.cuda()
+        mask = mask.cuda()
+        amp = amp.cuda()
+        y_pred0, mask_pred, amp_pred = model(x)
+        print(y_pred0.shape, mask_pred.shape, amp_pred.shape)
+        y_pred = y_pred0 * x
+        k1 = 0.1
+        k2 = 1.0
+        loss = (
+            loss_func(y_pred[mask], y[mask])
+            + k1 * loss_mask_func(mask_pred[mask_mask], mask.float()[mask_mask])
+            + k2 * loss_func(amp_pred[mask], amp[mask])
+        )
+        print(loss.item())
+        if train:
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        loss_sum += loss.item()
 
-    Config.net = getattr(eigennet, args.net)(in_feat_num, out_feat_num, linear = (not args.nonlinear))
+    torch.save(
+        {
+            "x": x.detach().cpu(),
+            "y_pred": y_pred0.detach().cpu(),
+            "y_pred_x": y_pred.detach().cpu(),
+            "y": y.detach().cpu(),
+        },
+        outdir + ".pt",
+    )
 
-    # Config.net = ConvNet(24, 24)
-    Config.optimizer = optim.Adam(Config.net.parameters(), lr=1e-4)
-    Config.scheduler = optim.lr_scheduler.StepLR(Config.optimizer, step_size=5, gamma=0.8)
-    Config.BATCH_SIZE = 1
-    Config.dataset_worker_num = 8
+    return loss_sum / len(loader)
 
-    start_train(100)
+
+best_loss = 1e10
+
+for epoch in range(args.epoch):
+    train_loss = step("log/train/" + str(epoch), train=True)
+    writer.add_scalar("train_loss", train_loss, epoch)
+    val_loss = step("log/valid/" + str(epoch), train=False)
+    writer.add_scalar("val_loss", val_loss, epoch)
+    scheduler.step(val_loss)
+    print("Epoch %d, train loss %.5f, val loss %.5f" % (epoch, train_loss, val_loss))
+    if val_loss < best_loss:
+        best_loss = val_loss
+        torch.save(model.state_dict(), log_dir + "/best.pth")
+
+writer.close()

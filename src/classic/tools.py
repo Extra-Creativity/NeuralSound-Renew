@@ -88,7 +88,7 @@ def voxelize_pointcloud(mesh_name, res = 32, augnum = 0):
         points = (points - (max_bound+min_bound)/2) / (max_bound - min_bound).max()
         return points
 
-    point_num = tri_num * 2
+    point_num = tri_num * 4
     point_clouds = [mesh.sample_points_uniformly(number_of_points=point_num)]
     results = []
     for _ in range(augnum):
